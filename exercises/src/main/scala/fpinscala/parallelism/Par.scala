@@ -23,7 +23,23 @@ object Par {
       val bf = b(es)
       UnitFuture(f(af.get, bf.get)) // This implementation of `map2` does _not_ respect timeouts, and eagerly waits for the returned futures. This means that even if you have passed in "forked" arguments, using this map2 on them will make them wait. It simply passes the `ExecutorService` on to both `Par` values, waits for the results of the Futures `af` and `bf`, applies `f` to them, and wraps them in a `UnitFuture`. In order to respect timeouts, we'd need a new `Future` implementation that records the amount of time spent evaluating `af`, then subtracts that time from the available time allocated for evaluating `bf`.
     }
-  
+
+  def lazyUnit[A](a: => A): Par[A] = fork(unit(a))
+
+  def asyncF[A,B](f: A => B): A => Par[B] = a => lazyUnit(f(a))
+
+  def map2to[A,B,C](a: Par[A], b: Par[B])(f: (A,B) => C)(timeout: Long, unit: TimeUnit): Par[C] =
+    (es: ExecutorService) => {
+      val af = a(es)
+      val bf = b(es)
+      val now = System.currentTimeMillis()
+      val afg = af.get(timeout, unit)
+      val usedMs = System.currentTimeMillis() - now
+      val left = timeout - unit.convert(usedMs, TimeUnit.MILLISECONDS)
+      if (left <= 0) throw new TimeoutException
+      UnitFuture(f(af.get, bf.get(left, unit)))
+    }
+
   def fork[A](a: => Par[A]): Par[A] = // This is the simplest and most natural implementation of `fork`, but there are some problems with it--for one, the outer `Callable` will block waiting for the "inner" task to complete. Since this blocking occupies a thread in our thread pool, or whatever resource backs the `ExecutorService`, this implies that we're losing out on some potential parallelism. Essentially, we're using two threads when one should suffice. This is a symptom of a more serious problem with the implementation, and we will discuss this later in the chapter.
     es => es.submit(new Callable[A] { 
       def call = a(es).get
@@ -33,6 +49,40 @@ object Par {
     map2(pa, unit(()))((a,_) => f(a))
 
   def sortPar(parList: Par[List[Int]]) = map(parList)(_.sorted)
+
+  def sequence[A](ps: List[Par[A]]): Par[List[A]] =
+    ps.foldLeft(unit(Nil: List[A]))((acc,x) => map2(acc,x)((a,b) => a :+ b))
+
+  def parMap[A,B](ps: List[A])(f: A => B): Par[List[B]] = fork {
+    val fbs: List[Par[B]] = ps.map(asyncF(f))
+    sequence(fbs)
+  }
+
+  def parFilter[A](as: List[A])(f: A => Boolean): Par[List[A]] = fork {
+    val fas = as.map(asyncF(a => if (f(a)) List(a) else Nil))
+    val s = sequence(fas)
+    // this step is not done in parallel
+    // so the parFilter is useful only in the case if calling f is expensive
+    // otherwise the overhead of flattening will negate the benefit of parallelisation
+    map(s)(_.flatten)
+  }
+
+  def parMax[A:Comparable](as: IndexedSeq[A]): Par[A] = {
+    ???
+  }
+
+  def parWordCount(as:List[String]): Par[Int] = {
+    ???
+  }
+
+  def map3[A,B,C,D](a: Par[A], b: Par[B], c: Par[C])(f: (A,B,C) => D): Par[D] =
+    ???
+
+  def map4[A,B,C,D,E](a: Par[A], b: Par[B], c: Par[C], d: Par[D])(f: (A,B,C,D) => E): Par[E] =
+    ???
+
+  def map5[A,B,C,D,E,F](a: Par[A], b: Par[B], c: Par[C], d: Par[D], e: Par[E])(f: (A,B,C,D,E) => F): Par[F] =
+    ???
 
   def equal[A](e: ExecutorService)(p: Par[A], p2: Par[A]): Boolean = 
     p(e).get == p2(e).get
