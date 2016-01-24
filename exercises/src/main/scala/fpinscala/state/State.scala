@@ -129,12 +129,12 @@ object State extends App {
 
   def operate = (i: Input) => (s: Machine) => i match {
     case _ if s.candies == 0 => s
-    case Coin if s.locked => s.copy(locked = false, coins = s.coins + 1))
-    case Turn if !s.locked => s.copy(locked = true, candies = s.candies - 1))
+    case Coin if s.locked => s.copy(locked = false, coins = s.coins + 1)
+    case Turn if !s.locked => s.copy(locked = true, candies = s.candies - 1)
     case _ => s
   }
 
-  def simulateMachine(inputs: List[Input]): State[Machine, (Int, Int)] = {
+  def simulateMachine(inputs: List[Input]): Unit = {
     val machine = Machine(locked = true, 5, 10)
     val result = inputs.foldLeft(machine) { (a, b) => operate(b)(a) }
     println(result)

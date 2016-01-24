@@ -1,8 +1,9 @@
 package fpinscala.parallelism
 
-import java.util.concurrent.{Callable, CountDownLatch, ExecutorService}
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent._
+
 import language.implicitConversions
+import scala.annotation.tailrec
 
 object Nonblocking {
 
@@ -37,8 +38,7 @@ object Nonblocking {
 
     def fork[A](a: => Par[A]): Par[A] =
       es => new Future[A] {
-        def apply(cb: A => Unit): Unit =
-          eval(es)(a(es)(cb))
+        def apply(cb: A => Unit): Unit = eval(es)(a(es)(cb))
       }
 
     /**
@@ -54,7 +54,13 @@ object Nonblocking {
      * asynchronously, using the given `ExecutorService`.
      */
     def eval(es: ExecutorService)(r: => Unit): Unit =
-      es.submit(new Callable[Unit] { def call = r })
+      es.submit(new Callable[Unit] {
+        def call = try {
+          r
+        } catch {
+          case e: Exception => ??? // TODO
+        }
+      })
 
 
     def map2[A,B,C](p: Par[A], p2: Par[B])(f: (A,B) => C): Par[C] =
@@ -171,4 +177,24 @@ object Nonblocking {
       def zip[B](b: Par[B]): Par[(A,B)] = p.map2(b)((_,_))
     }
   }
+}
+
+object TestNonBlocking extends App {
+  import fpinscala.parallelism.Nonblocking.Par
+  import fpinscala.parallelism.Nonblocking.Par._
+
+  val p = sequence(List.range(-1, 1).map(lazyUnit(_)).map(map(_)(a =>
+    if (a<0) {
+      new Exception().printStackTrace()
+      throw new IllegalArgumentException(a.toString)
+    } else math.sqrt(a)
+  )))
+
+  val S = Executors.newFixedThreadPool(2)
+
+  val x = run(S)(p)
+
+  println(x)
+
+  S.shutdown()
 }

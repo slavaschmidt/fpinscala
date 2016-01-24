@@ -1,7 +1,10 @@
 package fpinscala.parallelism
 
 import java.util.concurrent._
+import fpinscala.parallelism.Par.Par
+
 import language.implicitConversions
+import scala.annotation.tailrec
 
 object Par {
   type Par[A] = ExecutorService => Future[A]
@@ -40,8 +43,8 @@ object Par {
       UnitFuture(f(af.get, bf.get(left, unit)))
     }
 
-  def fork[A](a: => Par[A]): Par[A] = // This is the simplest and most natural implementation of `fork`, but there are some problems with it--for one, the outer `Callable` will block waiting for the "inner" task to complete. Since this blocking occupies a thread in our thread pool, or whatever resource backs the `ExecutorService`, this implies that we're losing out on some potential parallelism. Essentially, we're using two threads when one should suffice. This is a symptom of a more serious problem with the implementation, and we will discuss this later in the chapter.
-    es => es.submit(new Callable[A] { 
+  def fork[A](a: => Par[A]): Par[A] =
+    es => es.submit(new Callable[A] {
       def call = a(es).get
     })
 
@@ -63,26 +66,53 @@ object Par {
     val s = sequence(fas)
     // this step is not done in parallel
     // so the parFilter is useful only in the case if calling f is expensive
-    // otherwise the overhead of flattening will negate the benefit of parallelisation
+    // otherwise the overhead of flattening will negate the benefit of parallelism
     map(s)(_.flatten)
   }
 
-  def parMax[A:Comparable](as: IndexedSeq[A]): Par[A] = {
-    ???
+  def sum(ints: IndexedSeq[Int]): Par[Int] =
+    if (ints.length <= 1)
+      Par.unit(ints.headOption getOrElse 0)
+    else {
+        val (l,r) = ints.splitAt(ints.length/2)
+        Par.map2(Par.fork(sum(l)), Par.fork(sum(r)))(_ + _)
+      }
+
+
+  def reduce[A,B](as: List[A])(m: A => B)(re: (B,B) => B): Par[B] =
+    if (as.length <= 1)
+      Par.unit(m(as.head))
+    else {
+      val (l,r) = as.splitAt(as.length/2)
+      map2to(Par.fork(reduce(l)(m)(re)), Par.fork(reduce(r)(m)(re)))(re)(10, TimeUnit.MILLISECONDS)
+    }
+
+
+  def parMax(as: IndexedSeq[Int]): Par[Int] =
+    reduce(as.toList)(a => a) { (a, b) => if (a > b) a else b }
+
+  def parWordCount(as:List[String]): Par[Int] =
+    reduce(as)(_.split("\\s+").length)(_ + _)
+
+  // in terms of map2:
+
+  def map3[A,B,C,D](a: Par[A], b: Par[B], c: Par[C])(f: (A,B,C) => D): Par[D] = {
+    val fc = f.curried
+    val im = map2(a,b)((xa,xb) => fc(xa)(xb))
+    map2(c, im)((xc, xim) => xim(xc))
   }
 
-  def parWordCount(as:List[String]): Par[Int] = {
-    ???
+  def map4[A,B,C,D,E](a: Par[A], b: Par[B], c: Par[C], d: Par[D])(f: (A,B,C,D) => E): Par[E] = {
+    val fc = f.curried
+    val im = map3(a,b,c)((xa,xb,xc) => fc(xa)(xb)(xc))
+    map2(d, im)((xd, xim) => xim(xd))
   }
 
-  def map3[A,B,C,D](a: Par[A], b: Par[B], c: Par[C])(f: (A,B,C) => D): Par[D] =
-    ???
-
-  def map4[A,B,C,D,E](a: Par[A], b: Par[B], c: Par[C], d: Par[D])(f: (A,B,C,D) => E): Par[E] =
-    ???
-
-  def map5[A,B,C,D,E,F](a: Par[A], b: Par[B], c: Par[C], d: Par[D], e: Par[E])(f: (A,B,C,D,E) => F): Par[F] =
-    ???
+  def map5[A,B,C,D,E,F](a: Par[A], b: Par[B], c: Par[C], d: Par[D], e: Par[E])(f: (A,B,C,D,E) => F): Par[F] = {
+    val fc = f.curried
+    val im = map3(a,b,c)((xa,xb,xc) => fc(xa)(xb)(xc))
+    map3(d,e,im)((xd, xe, xim) => xim(xd)(xe))
+  }
 
   def equal[A](e: ExecutorService)(p: Par[A], p2: Par[A]): Boolean = 
     p(e).get == p2(e).get
@@ -95,6 +125,42 @@ object Par {
       if (run(es)(cond).get) t(es) // Notice we are blocking on the result of `cond`.
       else f(es)
 
+  def choiceN[A](n: Par[Int])(choices: List[Par[A]]): Par[A] =
+    es =>
+      choices.apply(run(es)(n).get)(es)
+
+  def choiceViaChoiceN[A](cond: Par[Boolean])(t: Par[A], f: Par[A]): Par[A] = {
+    def bool2int(cond: Par[Boolean]) = map(cond)(if (_) 0 else 1)
+    choiceN(bool2int(cond))(List(t,f))
+  }
+
+  def choiceMap[K,V](key: Par[K])(choices: Map[K,Par[V]]): Par[V] =
+    es => {
+      val k = run(es)(key).get
+      choices(k)(es)
+    }
+
+  def choiceGen[A, B](selector: Par[A])(selection: A => Par[B]): Par[B] = es => {
+    val sel = run(es)(selector).get
+    selection(sel)(es)
+  }
+
+  def choiceViaGen[A](n: Par[Boolean])(a: Par[A], b: Par[A]): Par[A] = choiceGen(n)(c => if (c) a else b)
+
+  def choiceNViaGen[A](n: Par[Int])(choices: List[Par[A]]): Par[A] = choiceGen(n)(choices.apply)
+
+  def choiceMapViaGen[K,V](key: Par[K])(choices: Map[K,Par[V]]): Par[V] = choiceGen(key)(choices.apply)
+
+  // 100% match :)
+  def chooser[A,B](pa: Par[A])(choices: A => Par[B]): Par[B] = choiceGen(pa)(choices)
+
+  def join[A](a: Par[Par[A]]): Par[A] = es =>
+    run(es)(run(es)(a).get())
+
+  def flatMap[A,B](pa: Par[A])(choices: A => Par[B]): Par[B] = join(map(pa)(choices))
+
+  def joinViaFlatMap[A](a: Par[Par[A]]): Par[A] = flatMap(a)(b => b)
+
   /* Gives us infix syntax for `Par`. */
   implicit def toParOps[A](p: Par[A]): ParOps[A] = new ParOps(p)
 
@@ -105,7 +171,6 @@ object Par {
 }
 
 object Examples {
-  import Par._
   def sum(ints: IndexedSeq[Int]): Int = // `IndexedSeq` is a superclass of random-access sequences like `Vector` in the standard library. Unlike lists, these sequences provide an efficient `splitAt` method for dividing them into two parts at a particular index.
     if (ints.size <= 1)
       ints.headOption getOrElse 0 // `headOption` is a method defined on all collections in Scala. We saw this function in chapter 3.
@@ -114,4 +179,78 @@ object Examples {
       sum(l) + sum(r) // Recursively sum both halves and add the results together.
     }
 
+}
+
+/*
+
+  Ex. 7.7
+
+  Given: map(y)(id) == y
+  Prove: map(map(y)(g))(f) == map(y)(f compose g)
+
+  0. TODO: Read "Theorems for free!"
+
+
+  Ex. 7.8
+
+  fork(x) == x
+
+  Revisit your implementation of fork and try to find a counterexample or convince yourself that the law holds for your implementation.
+
+
+  1. RejectedExecutionException is thrown by the submit method of the ExecutorService which could break the law
+  2. There are bounded an unbounded sizes of the thread pools in different implementations.
+      With fixed size there could be a problems forking a computation which could lead to the deadlock
+
+  Ex. 7.9
+
+  Show that any fixed-size thread pool can be made to deadlock given this implementation of fork.
+
+  Given the size of the pool == N, the idea is to start n+1 computations.
+  The computation k should depend on computation k+1 in order to finish.
+
+
+  Ex. 7.10
+
+  Our non-blocking representation doesn’t currently handle errors at all. If at any point our computation throws an exception, the run implementation’s latch never counts down and the exception is simply swallowed. Can you fix that?
+
+  1. The minimally intrusive change would be to add a timeout to countdown latch and a default "error" value for run method.
+    This is not type-safe
+  2. TODO
+
+
+ */
+
+object Ex7_9 extends App {
+  import Par._
+
+  @tailrec
+  def wrap[A](n: Int, start: Par[A]): Par[A] =
+    if (n == 0) start
+    else wrap(n-1, fork(start))
+
+  val sizeOfPool = 25
+  val a = lazyUnit(sizeOfPool)
+  val S = Executors.newFixedThreadPool(sizeOfPool)
+
+  println(Par.equal(S)(a, wrap(sizeOfPool, a)))
+
+  S.shutdown()
+}
+
+object TestBlocking extends App with Text {
+    import Par._
+    val S = Executors.newCachedThreadPool()
+    val in = (1 to 10).toIndexedSeq
+    println(run(S)(parMax(in)).get)
+
+    println(run(S)(parWordCount(text)).get)
+    S.shutdown()
+}
+
+trait Text {
+  val text = """It is important that the equals method for an instance of Ordered[A] be consistent with the compare method. However, due to limitations inherent in the type erasure semantics, there is no reasonable way to provide a default implementation of equality for instances of Ordered[A]. Therefore, if you need to be able to use equality on an instance of Ordered[A] you must provide it yourself either when inheriting or instantiating.
+               |
+               |It is important that the hashCode method for an instance of Ordered[A] be consistent with the compare method. However, it is not possible to provide a sensible default implementation. Therefore, if you need to be able compute the hash of an instance of Ordered[A] you must provide it yourself either when inheriting or instantiating.
+               |""".split("\n").toList
 }
