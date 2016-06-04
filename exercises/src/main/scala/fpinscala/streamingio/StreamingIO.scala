@@ -104,7 +104,8 @@ object SimpleStreamTransducers {
     def apply(s: Stream[I]): Stream[O] = this match {
       case Halt() => Stream()
       case Await(recv) => s match {
-        case h #:: t => recv(Some(h))(t)
+        case h #:: t =>
+          recv(Some(h))(t)
         case xs => recv(None)(xs) // Stream is empty
       }
       case Emit(h,t) => h #:: t(s)
@@ -136,7 +137,17 @@ object SimpleStreamTransducers {
     /*
      * Exercise 5: Implement `|>`. Let the types guide your implementation.
      */
-    def |>[O2](p2: Process[O,O2]): Process[I,O2] = ???
+    def |>[O2](p2: Process[O,O2]): Process[I,O2] = p2 match {
+      case Halt() => Halt()
+      case Emit(h2, t2) => Emit(h2, this |> t2)
+      case Await(recv2) => this match {
+        case Halt() => Halt() |> recv2(None)
+        case Emit(h, t) => t |> recv2(Some(h))
+        case Await(recv) => Await(recv.andThen(_ |> p2))
+      }
+
+
+    }
 
     /*
      * Feed `in` to this `Process`. Uses a tail recursive loop as long
@@ -200,7 +211,10 @@ object SimpleStreamTransducers {
     /*
      * Exercise 6: Implement `zipWithIndex`.
      */
-    def zipWithIndex: Process[I,(O,Int)] = ???
+    def zipWithIndex: Process[I,(O,Int)] = {
+      var idx = -1
+      this.map { a => idx+=1; (a, idx) }
+    }
 
     /* Add `p` to the fallback branch of this process */
     def orElse(p: Process[I,O]): Process[I,O] = this match {
@@ -292,13 +306,37 @@ object SimpleStreamTransducers {
     /*
      * Exercise 1: Implement `take`, `drop`, `takeWhile`, and `dropWhile`.
      */
-    def take[I](n: Int): Process[I,I] = ???
+    def take[I](n: Int): Process[I,I] = {
+      def go(m: Int): Process[I, I] =
+        Await[I, I] {
+          case Some(i) if m > 0 => emit(i, go(m-1))
+          case _ => Halt()
+        }
+      go(n)
+    }
 
-    def drop[I](n: Int): Process[I,I] = ???
+    def drop[I](n: Int): Process[I,I] = {
+      def go(m: Int): Process[I, I] =
+        Await[I, I] {
+          case Some(i) if m > 0 => go(m-1)
+          case Some(i) => emit(i, go(m))
+          case _ => Halt()
+        }
+      go(n)
+    }
 
-    def takeWhile[I](f: I => Boolean): Process[I,I] = ???
+    def takeWhile[I](f: I => Boolean): Process[I,I] =
+      Await[I, I] {
+        case Some(i) if f(i) => emit(i, takeWhile(f))
+        case _ => Halt()
+      }
 
-    def dropWhile[I](f: I => Boolean): Process[I,I] = ???
+    def dropWhile[I](f: I => Boolean): Process[I,I] =
+      Await[I, I] {
+        case Some(i) if f(i) => Halt()
+        case Some(i) => emit(i, id)
+        case _ => Halt()
+      }.repeat
 
     /* The identity `Process`, just repeatedly echos its input. */
     def id[I]: Process[I,I] = lift(identity)
@@ -306,7 +344,13 @@ object SimpleStreamTransducers {
     /*
      * Exercise 2: Implement `count`.
      */
-    def count[I]: Process[I,Int] = ???
+    def count[I]: Process[I,Int] = {
+      def go(cnt: Int): Process[I, Int] = Await[I,Int] {
+        case Some(i) => emit(cnt+1, go(cnt+1))
+        case _ => Halt()
+      }
+      go(0)
+    }
 
     /* For comparison, here is an explicit recursive implementation. */
     def count2[I]: Process[I,Int] = {
@@ -318,7 +362,11 @@ object SimpleStreamTransducers {
     /*
      * Exercise 3: Implement `mean`.
      */
-    def mean: Process[Double,Double] = ???
+    def mean: Process[Double,Double] = {
+      def go(acc: Double, cnt: Int): Process[Double,Double] =
+        await(d => emit((d+acc)/(cnt+1).toFloat, go(d+acc, cnt+1)))
+      go(0.0,0)
+    }
 
     def loop[S,I,O](z: S)(f: (I,S) => (O,S)): Process[I,O] =
       await((i: I) => f(i,z) match {
@@ -327,9 +375,9 @@ object SimpleStreamTransducers {
 
     /* Exercise 4: Implement `sum` and `count` in terms of `loop` */
 
-    def sum2: Process[Double,Double] = ???
+    def sum2: Process[Double,Double] = loop(0.0)((i,s) => (i+s,i+s))
 
-    def count3[I]: Process[I,Int] = ???
+    def count3[I]: Process[I,Int] = loop(0)((i,s) => (s+1,s+1))
 
     /*
      * Exercise 7: Can you think of a generic combinator that would
@@ -356,7 +404,14 @@ object SimpleStreamTransducers {
      * We choose to emit all intermediate values, and not halt.
      * See `existsResult` below for a trimmed version.
      */
-    def exists[I](f: I => Boolean): Process[I,Boolean] = ???
+    def exists[I](f: I => Boolean): Process[I,Boolean] = {
+      var trigger = false
+      def ex(i: I) = {
+        trigger = trigger || f(i)
+        trigger
+      }
+      lift(ex)
+    }
 
     /* Awaits then emits a single value, then halts. */
     def echo[I]: Process[I,I] = await(i => emit(i))
@@ -744,10 +799,15 @@ object GeneralizedStreamTransducers {
         { src => eval_ { IO(src.close) } }
 
     /* Exercise 11: Implement `eval`, `eval_`, and use these to implement `lines`. */
-    def eval[F[_],A](a: F[A]): Process[F,A] = ???
+    def eval[F[_],A](a: F[A]): Process[F,A] =
+      await(a) {
+        case Left(e) => Halt(e)
+        case Right(b) => Emit(b, Halt(End))
+      }
 
     /* Evaluate the action purely for its effects. */
-    def eval_[F[_],A,B](a: F[A]): Process[F,B] = ???
+    def eval_[F[_],A,B](a: F[A]): Process[F,B] =
+      eval(a).drain
 
     /* Helper function with better type inference. */
     def evalIO[A](a: IO[A]): Process[IO,A] =
@@ -908,7 +968,8 @@ object GeneralizedStreamTransducers {
       eval(IO(a)).flatMap { a => Emit(a, constant(a)) }
 
     /* Exercise 12: Implement `join`. Notice this is the standard monadic combinator! */
-    def join[F[_],A](p: Process[F,Process[F,A]]): Process[F,A] = ???
+    def join[F[_],A](p: Process[F,Process[F,A]]): Process[F,A] =
+      p.flatMap { a  => a }
 
     /*
      * An example use of the combinators we have so far: incrementally
@@ -1014,9 +1075,27 @@ object GeneralizedStreamTransducers {
 }
 
 object ProcessTest extends App {
+
+  val s = (1 to 10).toStream
+
+/*  println(SimpleStreamTransducers.Process.take(5)(s).toList)
+  println(SimpleStreamTransducers.Process.drop(5)(s).toList)
+
+  println(SimpleStreamTransducers.Process.takeWhile { a: Int => a < 5 }(s).toList)
+  println(SimpleStreamTransducers.Process.takeWhile { a: Int => a > 5 }(s).toList)
+
+  println(SimpleStreamTransducers.Process.dropWhile { a: Int => a < 5 }(s).toList)
+  println(SimpleStreamTransducers.Process.dropWhile { a: Int => a > 5 }(s).toList)*/
+
+  //println(SimpleStreamTransducers.Process.mean(s.map(_.toDouble).reverse).toList)
+
   import GeneralizedStreamTransducers._
   import fpinscala.iomonad.IO
   import Process._
+
+  println(SimpleStreamTransducers.Process.exists { i: Int => i > 4 }(s.reverse).toList)
+
+  System.exit(0)
 
   val p = eval(IO { println("woot"); 1 }).repeat
   val p2 = eval(IO { println("cleanup"); 2 } ).onHalt {
